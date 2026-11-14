@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Dataset, downloads, and generated training files
+data/
+cleaned_data/
+artifacts/
+runs/
+reports/
+checkpoints/
+*.zip
+all_data.zip*
+*.keras
+*.h5
+*.ckpt
+events.out.tfevents.*
+
+# Editors and OS
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,42 @@
+# Full-assignment defaults. Start on the laptop with configs/laptop_debug.yaml.
+data_dir: data/cleaned_data
+output_dir: runs
+model: custom_cnn
+image_size: 64
+batch_size: 32
+epochs: 15
+patience: 5
+learning_rate: 0.001
+seed: 5411
+
+# Official split: the first train_per_class samples of each character are the
+# training pool. The rest are the test set. Nothing is shuffled before that cut.
+train_per_class: 40
+# 0 keeps all 40 training samples for gradient updates.
+# A positive ratio holds out the tail of those 40 for early stopping only.
+val_ratio: 0.0
+# One epoch shows this many augmented views of each class that has 40 samples.
+target_samples_per_class: 200
+max_classes: null
+classes_file: null
+
+# imagenet for MobileNet / EfficientNet. "none" skips the weight download.
+weights: imagenet
+# false fine-tunes the pretrained base. true trains only the new classifier head.
+freeze_base: false
+cache: ""
+shuffle_buffer: 8192
+# Intra-op math threads for the next process. 10 is this laptop's physical core count.
+# Inter-op stays at 1 so those cores are not oversubscribed. A running process keeps its old pool.
+cpu_threads: 10
+
+augmentation:
+  rotation_degrees: 15
+  translation: 0.10
+  zoom: 0.15
+  scale: 0.10
+  shear_x: 0.25
+  shear_y: 0.15
+  # Fraction of each training batch left unchanged. The test images are clean,
+  # so the model has to see that appearance as well as the warped views.
+  clean_probability: 0.5
