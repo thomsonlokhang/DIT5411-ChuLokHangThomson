@@ -4,6 +4,11 @@
 # The RTX 4060 desktop should use WSL2 and:
 #   pip install -r requirements.txt
 #   pip install "tensorflow[and-cuda]"
+#
+# The school RTX 5070 Ti is Blackwell (compute capability 12.0). Native Windows
+# wheels do not use that GPU. Official Linux wheels often lack sm_120 kernels.
+# Use Ubuntu or WSL2 and a TensorFlow build compiled for sm_120 (CUDA 12.8+),
+# then confirm with:  python scripts/check_gpu.py
 tensorflow>=2.16
 numpy>=1.26
 PyYAML>=6.0

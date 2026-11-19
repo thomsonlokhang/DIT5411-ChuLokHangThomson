@@ -1,0 +1,83 @@
+# RTX 4060 (8 GB, Ada, compute capability 8.9) on this desktop.
+# WSL2 Ubuntu sees the card. One model uses the whole GPU.
+#
+# Train the assignment set (13,065 classes) with:
+#   python scripts/train_all.py --config configs/rtx4060.yaml \
+#     --data-dir /root/work/handwritting-data/cleaned_data
+#
+# The first 40 images of each character are the training pool. Each epoch
+# shows 200 augmented views of every full class. The test images are the
+# files after those 40, and they are not augmented.
+#
+# Batch sizes are about half of configs/rtx5070ti.yaml because this card
+# has 8 GB, not 16 GB. Learning rates follow the same square-root scaling
+# from the laptop baseline (batch 32, lr 0.001 for the CNNs, lr 0.0001
+# when fine-tuning an ImageNet network). custom_cnn is the exception: the
+# warp is no longer inside its compiled step, so its batch is 2048.
+#
+# The float32 disk cache stays at artifacts/tfcache/full. Training copies
+# those images into host RAM once, as uint8 (about 2 GB), and does not
+# rewrite the cache. Test images stay on the disk cache.
+data_dir: data/cleaned_data
+output_dir: runs
+model: custom_cnn
+image_size: 64
+batch_size: 128
+epochs: 15
+patience: 4
+learning_rate: 0.002
+seed: 5411
+
+train_per_class: 40
+val_ratio: 0.0
+target_samples_per_class: 200
+max_classes: null
+classes_file: null
+
+weights: imagenet
+freeze_base: false
+cache: artifacts/tfcache/full
+shuffle_buffer: 32768
+
+# i5-12500: 6 cores, 12 threads. Four threads stay with the GPU step.
+# Eight threads warp the next batch on the CPU at the same time.
+cpu_threads: 4
+inter_op_threads: 2
+input_threads: 8
+deterministic: false
+
+gpu_performance: true
+jit_compile: true
+# The compiled step is the bare network. One projective warp runs on the CPU.
+augment_on_gpu: false
+host_cache: true
+drop_remainder: true
+target_epoch_seconds: 60
+
+model_overrides:
+  custom_cnn:
+    # sqrt(2048/32) * 0.001 = 0.008. The warp is outside this step.
+    batch_size: 2048
+    learning_rate: 0.008
+  residual_cnn:
+    batch_size: 384
+    learning_rate: 0.0035
+  mobilenet_v2:
+    batch_size: 128
+    learning_rate: 0.0002
+  efficientnet_b0:
+    batch_size: 64
+    learning_rate: 0.00014
+  mobilenet_v3_small:
+    batch_size: 128
+    learning_rate: 0.0002
+
+augmentation:
+  rotation_degrees: 15
+  translation: 0.10
+  zoom: 0.15
+  scale: 0.10
+  shear_x: 0.25
+  shear_y: 0.15
+  # Half of each batch stays upright. The test images are upright.
+  clean_probability: 0.5

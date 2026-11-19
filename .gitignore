@@ -14,6 +14,7 @@ env/
 # Dataset, downloads, and generated training files
 data/
 cleaned_data/
+handwritting_data_all/
 artifacts/
 runs/
 reports/

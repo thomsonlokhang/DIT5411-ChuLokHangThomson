@@ -11,23 +11,31 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import random
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import yaml
 
-from src.cpu_threads import INTER_OP_THREADS, install_cpu_thread_env, resolve_cpu_threads
+from src.cpu_threads import (
+    install_cpu_thread_env,
+    install_gpu_performance_env,
+    resolve_thread_settings,
+)
 
 # TensorFlow reads the thread pool when it is imported. Set it first, and only
 # for a real training launch. Importing this module must not change a process
 # that is already running.
 if __name__ == "__main__":
-    install_cpu_thread_env(resolve_cpu_threads(sys.argv[1:]))
+    _intra, _inter = resolve_thread_settings(sys.argv[1:])
+    install_cpu_thread_env(_intra, _inter)
+    install_gpu_performance_env(sys.argv[1:])
 
-from src.data_pipeline import build_split_index, make_datasets
+from src.data_pipeline import attach_gpu_augmentation, build_split_index, make_datasets
 from src.models import MODEL_NAMES, build_model
 
 logger = logging.getLogger("dit5411.train")
@@ -52,6 +60,16 @@ DEFAULTS = {
     "cache": "",
     "shuffle_buffer": 8192,
     "cpu_threads": 10,
+    "inter_op_threads": 1,
+    "gpu_performance": False,
+    "jit_compile": False,
+    "augment_on_gpu": False,
+    "drop_remainder": False,
+    "host_cache": False,
+    "input_threads": 0,
+    "deterministic": True,
+    "target_epoch_seconds": None,
+    "model_overrides": {},
     "initial_weights": None,
     "run_name": None,
     "augmentation": {
@@ -74,7 +92,12 @@ def main(argv: list[str] | None = None) -> None:
 
     # Memory growth has to be set before the first GPU operation. set_seed
     # touches TensorFlow, so the device is configured first.
-    device = configure_device(tf, cpu_threads=int(config["cpu_threads"]))
+    device = configure_device(
+        tf,
+        cpu_threads=int(config["cpu_threads"]),
+        inter_op_threads=int(config["inter_op_threads"]),
+        gpu_performance=bool(config.get("gpu_performance")),
+    )
     set_seed(int(config["seed"]))
     logger.info(
         "TensorFlow %s | device: %s | policy: %s | CPU threads: %s intra-op, %s inter-op",
@@ -82,7 +105,7 @@ def main(argv: list[str] | None = None) -> None:
         device,
         tf.keras.mixed_precision.global_policy().name,
         int(config["cpu_threads"]),
-        INTER_OP_THREADS,
+        int(config["inter_op_threads"]),
     )
 
     index = build_split_index(
@@ -94,9 +117,16 @@ def main(argv: list[str] | None = None) -> None:
         target_samples_per_class=int(config["target_samples_per_class"]),
     )
     logger.info("\n%s", index.summary())
+    if config.get("gpu_performance") and not config.get("max_classes") and index.num_classes < 13065:
+        logger.warning(
+            "This run has %s classes. The assignment asks for 13,065 output neurons. "
+            "Pass the full cleaned_data folder with --data-dir when you report the final result.",
+            index.num_classes,
+        )
 
     image_size = int(config["image_size"])
     batch_size = int(config["batch_size"])
+    augment_on_gpu = bool(config.get("augment_on_gpu"))
     train_ds, val_ds, test_ds = make_datasets(
         index,
         image_size=image_size,
@@ -105,7 +135,28 @@ def main(argv: list[str] | None = None) -> None:
         augmentation=config.get("augmentation") or {},
         cache=str(config.get("cache") or ""),
         shuffle_buffer=int(config["shuffle_buffer"]),
+        augment_on_gpu=augment_on_gpu,
+        drop_remainder=bool(config.get("drop_remainder")),
+        input_threads=int(config.get("input_threads") or 0),
+        deterministic=bool(config.get("deterministic", True)),
+        host_cache=bool(config.get("host_cache")),
     )
+    views = len(index.train_paths) * index.repeats
+    steps = views // batch_size if config.get("drop_remainder") else math.ceil(views / batch_size)
+    logger.info(
+        "Steps this epoch: %s (%s augmented views, batch %s).",
+        f"{steps:,}",
+        f"{views:,}",
+        batch_size,
+    )
+    if config.get("host_cache") and not augment_on_gpu:
+        logger.info(
+            "The warp runs on the CPU. The compiled step is the network only. "
+            "The first epoch of this process also copies the training images into RAM and compiles the graph. "
+            "Judge the pace from ms/step on the epoch after that."
+        )
+    else:
+        logger.info("The first epoch in this process also compiles the graph.")
 
     model = build_model(
         name=config["model"],
@@ -114,15 +165,18 @@ def main(argv: list[str] | None = None) -> None:
         weights=config.get("weights"),
         freeze_base=bool(config["freeze_base"]),
     )
+    resume_path = _resume_checkpoint(config)
+    if resume_path is not None:
+        _load_matching_weights(model, resume_path)
+    if augment_on_gpu:
+        model = attach_gpu_augmentation(model, image_size, config.get("augmentation") or {})
+        logger.info("Augmentation is one composed warp on the device.")
     model.compile(
         optimizer=tf.keras.optimizers.Adam(float(config["learning_rate"])),
         loss="sparse_categorical_crossentropy",
         metrics=[tf.keras.metrics.SparseCategoricalAccuracy(name="accuracy")],
+        jit_compile=bool(config.get("jit_compile")),
     )
-    initial_weights = config.get("initial_weights") or None
-    if initial_weights:
-        model.load_weights(str(initial_weights))
-        logger.info("Loaded initial weights from %s", initial_weights)
     logger.info("Parameters: %s", f"{model.count_params():,}")
 
     run_dir = make_run_dir(config)
@@ -167,12 +221,23 @@ def main(argv: list[str] | None = None) -> None:
             min_lr=1e-6,
             verbose=1,
         ),
-        tf.keras.callbacks.CSVLogger(str(run_dir / "training_log.csv")),
+        tf.keras.callbacks.CSVLogger(str(run_dir / "training_log.csv"), append=resume_path is not None),
     ]
+    initial_epoch = _completed_epochs(run_dir / "training_log.csv") if resume_path is not None else 0
+    if initial_epoch:
+        logger.info(
+            "Continuing from epoch %s. The saved weights are already loaded. %s epochs remain in this plan.",
+            initial_epoch + 1,
+            max(0, int(config["epochs"]) - initial_epoch),
+        )
+    target_seconds = config.get("target_epoch_seconds")
+    if target_seconds:
+        callbacks.append(make_epoch_time_hint(tf, float(target_seconds)))
 
     history = model.fit(
         train_ds,
         validation_data=val_ds,
+        initial_epoch=initial_epoch,
         epochs=int(config["epochs"]),
         callbacks=callbacks,
         shuffle=False,
@@ -263,6 +328,7 @@ def parse_config(argv: list[str] | None) -> dict:
         default=None,
         help="Saved .keras model to load before training.",
     )
+    parser.add_argument("--inter-op-threads", dest="inter_op_threads", type=int, default=None)
     args = parser.parse_args(argv)
 
     file_config = {}
@@ -276,47 +342,132 @@ def parse_config(argv: list[str] | None) -> dict:
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     config = _deep_merge(DEFAULTS, file_config)
+    cli_keys = set()
     for key, value in vars(args).items():
         if key == "config" or value is None:
             continue
         config[key] = value
+        cli_keys.add(key)
+    overrides = config.get("model_overrides") or {}
+    chosen = overrides.get(config.get("model")) if isinstance(overrides, dict) else None
+    if isinstance(chosen, dict):
+        for key, value in chosen.items():
+            if key not in cli_keys:
+                config[key] = value
     if config.get("max_classes") in (0, "0"):
         config["max_classes"] = None
     return config
 
 
-def configure_device(tf, cpu_threads: int | None = None) -> str:
+def configure_device(
+    tf,
+    cpu_threads: int | None = None,
+    inter_op_threads: int | None = None,
+    gpu_performance: bool = False,
+) -> str:
     """Use the GPU with memory growth and mixed precision, or stay on the CPU."""
 
     if cpu_threads is not None:
-        _apply_cpu_threads(tf, int(cpu_threads))
+        _apply_cpu_threads(tf, int(cpu_threads), inter_op_threads)
     tf.config.set_soft_device_placement(True)
     gpus = tf.config.list_physical_devices("GPU")
     if not gpus:
         tf.keras.mixed_precision.set_global_policy("float32")
+        if gpu_performance:
+            raise SystemExit(
+                "This config expects a CUDA GPU, and TensorFlow sees none. "
+                "Train from Ubuntu with the project virtualenv active. "
+                "On the RTX 4060, install the CUDA libraries with: "
+                'python -m pip install "tensorflow[and-cuda]" '
+                "and then run: python scripts/check_gpu.py. "
+                "An RTX 5070 Ti also needs a TensorFlow build that includes sm_120 kernels."
+            )
         return "CPU"
     for gpu in gpus:
         try:
             tf.config.experimental.set_memory_growth(gpu, True)
         except RuntimeError as exc:
             logger.warning("Could not set memory growth on %s: %s", gpu, exc)
+        try:
+            details = tf.config.experimental.get_device_details(gpu)
+        except Exception:
+            details = {}
+        logger.info("GPU %s details: %s", gpu.name, details)
     try:
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
     except Exception as exc:
         logger.warning("Mixed precision is unavailable (%s). Using float32.", exc)
         tf.keras.mixed_precision.set_global_policy("float32")
+    if gpu_performance:
+        _probe_gpu(tf)
     names = ", ".join(device.name for device in gpus)
     return f"GPU ({names})"
 
 
-def _apply_cpu_threads(tf, cpu_threads: int) -> None:
-    """Request the thread pools. The environment set at launch is what sticks."""
+def _probe_gpu(tf) -> None:
+    """Fail before a long run if the Blackwell kernels are missing."""
 
     try:
+        with tf.device("/GPU:0"):
+            sample = tf.random.normal((512, 512))
+            _ = tf.matmul(sample, sample).numpy()
+    except Exception as exc:
+        raise SystemExit(
+            "The GPU is listed, but a test matmul failed. "
+            "An RTX 5070 Ti is Blackwell, compute capability 12.0. "
+            "Official TensorFlow 2.21 wheels often ship without sm_120 kernels, "
+            "and a PTX fallback can die with CUDA_ERROR_INVALID_PTX.\n"
+            f"Original error: {exc}\n"
+            "Use Ubuntu or WSL2 and a wheel built for sm_120. "
+            "An unofficial TensorFlow 2.21 Linux build is at "
+            "https://github.com/Syraxius/TensorflowDockerBuilder/releases/tag/v2.21.0-sm120-cuda128-py310-py313\n"
+            "If the error names the allocator, retry with TF_GPU_ALLOCATOR=default."
+        ) from exc
+    logger.info("GPU matmul succeeded. The card can run this training step.")
+
+
+def _apply_cpu_threads(tf, cpu_threads: int, inter_op_threads: int | None = None) -> None:
+    """Request the thread pools. The environment set at launch is what sticks."""
+
+    inter = 1 if inter_op_threads is None else int(inter_op_threads)
+    try:
         tf.config.threading.set_intra_op_parallelism_threads(cpu_threads)
-        tf.config.threading.set_inter_op_parallelism_threads(INTER_OP_THREADS)
+        tf.config.threading.set_inter_op_parallelism_threads(inter)
     except RuntimeError as exc:
         logger.warning("CPU thread pools were already fixed (%s).", exc)
+
+
+def make_epoch_time_hint(tf, target_seconds: float):
+    """Callback that logs epoch wall time. Epoch 1 includes the XLA compile."""
+
+    class EpochTimeHint(tf.keras.callbacks.Callback):
+        def __init__(self, seconds: float):
+            super().__init__()
+            self.target_seconds = float(seconds)
+            self._started = 0.0
+            self._epochs_seen = 0
+
+        def on_epoch_begin(self, epoch, logs=None):
+            self._started = time.perf_counter()
+
+        def on_epoch_end(self, epoch, logs=None):
+            elapsed = time.perf_counter() - self._started
+            self._epochs_seen += 1
+            logger.info("Epoch %s took %.1f seconds.", epoch + 1, elapsed)
+            if self._epochs_seen == 1:
+                logger.info(
+                    "This first epoch includes graph compile and the one-time image load. "
+                    "Judge the one-minute target from the next epoch."
+                )
+            elif elapsed > self.target_seconds * 1.15:
+                logger.warning(
+                    "Epoch took %.0f seconds, above the %.0f second target. "
+                    "The card is already on mixed precision. Raise the batch size if memory remains.",
+                    elapsed,
+                    self.target_seconds,
+                )
+
+    return EpochTimeHint(target_seconds)
 
 
 def set_seed(seed: int) -> None:
@@ -325,6 +476,94 @@ def set_seed(seed: int) -> None:
     import tensorflow as tf
 
     tf.keras.utils.set_random_seed(seed)
+
+
+def _resume_checkpoint(config: dict) -> Path | None:
+    """Checkpoint to continue, or None for a new run.
+
+    An explicit ``--initial-weights`` wins. Otherwise the named run's own
+    ``checkpoint.keras`` is used, so stopping and starting ``train_all`` keeps
+    the epochs that already finished.
+    """
+
+    explicit = config.get("initial_weights") or None
+    if explicit:
+        path = Path(str(explicit))
+        if not path.exists():
+            raise SystemExit(f"Initial weights were not found: {path}")
+        return path
+    run_name = config.get("run_name")
+    if not run_name or config.get("max_classes"):
+        return None
+    candidate = Path(config["output_dir"]) / str(config["model"]) / str(run_name) / "checkpoint.keras"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _completed_epochs(log_path: Path) -> int:
+    if not log_path.exists():
+        return 0
+    rows = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return max(0, len(rows) - 1)
+
+
+def _checkpoint_is_wrapped(path: Path) -> bool:
+    """True when the file is the full training model, not the bare classifier."""
+
+    if path.suffix != ".keras":
+        return False
+    import zipfile
+
+    with zipfile.ZipFile(path) as zipped:
+        if "config.json" not in zipped.namelist():
+            return False
+        text = zipped.read("config.json").decode("utf-8")
+    return "keep_clean" in text or "aug_composed" in text or "aug_rotation" in text
+
+
+def _load_matching_weights(model, path: Path) -> None:
+    """Load a checkpoint, including one saved from the older five-warp wrapper."""
+
+    import tensorflow as tf
+
+    if not _checkpoint_is_wrapped(path):
+        model.load_weights(str(path))
+        logger.info("Loaded initial weights from %s", path)
+        return
+
+    loaded = tf.keras.models.load_model(path, compile=False, safe_mode=False)
+    donor = _named_submodel(loaded, model.name)
+    if donor is None:
+        raise SystemExit(f"No weights named {model.name} were found in {path}")
+    copied = 0
+    for layer in donor.layers:
+        try:
+            target = model.get_layer(layer.name)
+        except ValueError:
+            continue
+        weights = layer.get_weights()
+        if not weights:
+            continue
+        current = target.get_weights()
+        if [tuple(item.shape) for item in current] != [tuple(item.shape) for item in weights]:
+            continue
+        target.set_weights(weights)
+        copied += 1
+    if copied == 0:
+        raise SystemExit(f"No matching layers could be copied from {path}")
+    logger.info("Copied %s layers from %s", copied, path)
+
+
+def _named_submodel(model, name: str):
+    import tensorflow as tf
+
+    matches = [layer for layer in getattr(model, "layers", []) if isinstance(layer, tf.keras.Model) and layer.name == name]
+    if len(matches) == 1:
+        return matches[0]
+    if getattr(model, "name", None) == name:
+        return model
+    return matches[0] if matches else None
 
 
 def make_run_dir(config: dict) -> Path:

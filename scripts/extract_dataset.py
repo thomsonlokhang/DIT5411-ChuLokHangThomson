@@ -28,7 +28,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--parts-dir", type=Path, help="Directory that contains all_data.zip.001, .002, ...")
     parser.add_argument("--zip", dest="zips", type=Path, action="append", default=[], help="A zip file to extract. Repeatable.")
     parser.add_argument("--output", type=Path, required=True, help="Directory that will contain cleaned_data.")
-    parser.add_argument("--encoding", default="big5", help="Zip filename encoding when the UTF-8 flag is not set.")
+    parser.add_argument(
+        "--encoding",
+        default="cp950",
+        help="Zip filename encoding when the UTF-8 flag is not set. "
+        "The full release uses Microsoft Big5 (cp950). Python's strict big5 codec "
+        "rejects characters such as those whose lead byte is 0xF9.",
+    )
     parser.add_argument(
         "--organize",
         action="store_true",
@@ -76,27 +82,63 @@ def combine_parts(parts_dir: Path, output: Path) -> Path:
 
 def extract_zip(archive: Path, output: Path, encoding: str) -> None:
     print(f"Extracting {archive}")
-    try:
-        zipped = zipfile.ZipFile(archive, metadata_encoding=encoding)
-    except TypeError:
-        zipped = zipfile.ZipFile(archive)
+    with open_zip(archive, encoding) as zipped:
+        _extract_members(zipped, output)
+
+
+def open_zip(archive: Path, encoding: str) -> zipfile.ZipFile:
+    """Open a zip whose filenames are Traditional Chinese, not UTF-8.
+
+    ``cp950`` is tried before strict ``big5``. Characters such as 碁 are
+    encoded with lead byte 0xF9 in the Microsoft Big5 code page, and
+    ``str.decode('big5')`` raises UnicodeDecodeError on those names.
+    """
+
+    candidates = []
+    for name in (encoding, "cp950", "big5hkscs", "big5"):
+        if name and name not in candidates:
+            candidates.append(name)
+    errors = []
+    for candidate in candidates:
+        opened = None
+        try:
+            opened = zipfile.ZipFile(archive, metadata_encoding=candidate)
+            opened.namelist()
+        except TypeError:
+            return zipfile.ZipFile(archive)
+        except UnicodeDecodeError as exc:
+            if opened is not None:
+                opened.close()
+            errors.append(f"{candidate}: {exc}")
+            continue
+        if candidate != encoding:
+            print(f"Filename encoding {encoding!r} cannot read this archive. Using {candidate}.")
+        return opened
+    detail = "\n".join(errors)
+    raise SystemExit(
+        "Could not decode the character names in this zip.\n"
+        f"{detail}\n"
+        "Re-run with --encoding cp950."
+    )
+
+
+def _extract_members(zipped: zipfile.ZipFile, output: Path) -> None:
     count = 0
-    with zipped:
-        for info in zipped.infolist():
-            name = info.filename.replace("\\", "/").lstrip("/")
-            if not name or name.endswith("/"):
-                continue
-            destination = _safe_destination(output, name)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with zipped.open(info) as source, destination.open("wb") as target:
-                while True:
-                    chunk = source.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    target.write(chunk)
-            count += 1
-            if count % 5000 == 0:
-                print(f"  {count} files")
+    for info in zipped.infolist():
+        name = info.filename.replace("\\", "/").lstrip("/")
+        if not name or name.endswith("/"):
+            continue
+        destination = _safe_destination(output, name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipped.open(info) as source, destination.open("wb") as target:
+            while True:
+                chunk = source.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                target.write(chunk)
+        count += 1
+        if count % 5000 == 0:
+            print(f"  {count} files")
     print(f"  extracted {count} files")
 
 
